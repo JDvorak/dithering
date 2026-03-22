@@ -4,6 +4,10 @@ const { rgbToLab } = require('./color');
 const { computeContourFlow, solveCurvedCoordinates } = require('./flow');
 const { createProgressiveMask, sampleParkerThreshold } = require('./masks');
 
+function clamp(value, min, max) {
+  return value < min ? min : value > max ? max : value;
+}
+
 function runRandomwalkBw(imageData, options = {}) {
   const width = imageData.width;
   const height = imageData.height;
@@ -75,10 +79,6 @@ function computeSimpleRegional(grad, width, height) {
   
   // Apply light blur for smoothness
   return { entropy: boxBlur(entropy, width, height, 1), labels };
-}
-
-function clamp(value, min, max) {
-  return value < min ? min : value > max ? max : value;
 }
 
 module.exports = {

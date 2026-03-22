@@ -8,17 +8,18 @@ const { runRandomwalkBw } = require('./src/randomwalk-bw/pipeline-fast');
 const inputPath = process.argv[2] || 'test1.png';
 const outputPath = process.argv[3] || '/tmp/test_fast.png';
 
+(async () => {
 console.log(`Processing ${inputPath} (fast pipeline)...`);
 const startTime = Date.now();
 
-const imageData = loadImageData(inputPath);
+const imageData = await loadImageData(inputPath);
 const result = runRandomwalkBw(imageData, {
   parkerPeriod: 1,
   parkerMaskSize: 64,
   maskCandidates: 12,
   bendStrength: 0.7,
   frequencyWarp: 0.35,
-  coordinateIterations: 40,
+  coordinateIterations: 8,
   coordinateAnchor: 0.08,
   entropyDensityStrength: 0.18,
   fineBendBoost: 0.55,
@@ -53,3 +54,7 @@ fs.writeFileSync(outputPath, canvas.toBuffer('image/png'));
 const totalTime = Date.now() - startTime;
 console.log(`Total: ${totalTime}ms`);
 console.log(`Saved ${outputPath}`);
+})().catch(err => {
+  console.error('Error:', err);
+  process.exit(1);
+});

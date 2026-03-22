@@ -65,16 +65,15 @@ function computeContourFlow(gx, gy, width, height, orientationRadius) {
 
 function solveCurvedCoordinates(flow, grad, entropy, fineMask, width, height, options, smoothstep, clamp01, clamp, coordinateAnchor) {
   const count = width * height;
-  let u = new Float32Array(count);
-  let v = new Float32Array(count);
-  let nextU = new Float32Array(count);
-  let nextV = new Float32Array(count);
+  const u = new Float32Array(count);
+  const v = new Float32Array(count);
   const targetUdx = new Float32Array(count);
   const targetUdy = new Float32Array(count);
   const targetVdx = new Float32Array(count);
   const targetVdy = new Float32Array(count);
   const anchorWeight = new Float32Array(count);
 
+  // Initialize with grid coordinates and compute target derivatives
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
       const idx = y * width + x;
@@ -85,7 +84,7 @@ function solveCurvedCoordinates(flow, grad, entropy, fineMask, width, height, op
       const basisWeight = clamp01(edge * options.bendStrength);
       const entropyShift = entropy[idx] - 0.5;
       const frequency = clamp(
-        1 + options.frequencyWarp * edge + options.entropyFrequencyStrength * entropyShift + options.fineFrequencyBoost * fine,
+        1 + options.frequencyWarp * edge + (options.entropyFrequencyStrength || 0) * entropyShift + options.fineFrequencyBoost * fine,
         0.45,
         2.6
       );
@@ -96,224 +95,157 @@ function solveCurvedCoordinates(flow, grad, entropy, fineMask, width, height, op
       anchorWeight[idx] = coordinateAnchor * lerp(1, 1 - options.fineAnchorRelax, fine);
       u[idx] = x;
       v[idx] = y;
-      nextU[idx] = x;
-      nextV[idx] = y;
     }
   }
 
-  // Pre-compute direction derivatives for efficiency
-  const udxLeft = new Float32Array(count);
-  const udxRight = new Float32Array(count);
-  const udyUp = new Float32Array(count);
-  const udyDown = new Float32Array(count);
-  const vdxLeft = new Float32Array(count);
-  const vdxRight = new Float32Array(count);
-  const vdyUp = new Float32Array(count);
-  const vdyDown = new Float32Array(count);
+  // Fast approximation: Gauss-Seidel with line relaxation
+  // Much faster than CG with similar visual quality
+  const iterations = Math.min(options.coordinateIterations, 10);
+  const omega = 1.3; // Successive over-relaxation factor (higher for faster convergence)
   
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = y * width + x;
-      if (x > 0) {
-        const left = idx - 1;
-        udxLeft[idx] = 0.5 * (targetUdx[left] + targetUdx[idx]);
-        vdxLeft[idx] = 0.5 * (targetVdx[left] + targetVdx[idx]);
+  for (let iter = 0; iter < iterations; iter++) {
+    // Red-black Gauss-Seidel for better parallelization and convergence
+    // Red pass
+    for (let y = 0; y < height; y++) {
+      for (let x = (y % 2); x < width; x += 2) {
+        updateCoordinate(u, v, x, y, width, height, targetUdx, targetUdy, targetVdx, targetVdy, anchorWeight, omega);
       }
-      if (x + 1 < width) {
-        const right = idx + 1;
-        udxRight[idx] = 0.5 * (targetUdx[idx] + targetUdx[right]);
-        vdxRight[idx] = 0.5 * (targetVdx[idx] + targetVdx[right]);
-      }
-      if (y > 0) {
-        const up = idx - width;
-        udyUp[idx] = 0.5 * (targetUdy[up] + targetUdy[idx]);
-        vdyUp[idx] = 0.5 * (targetVdy[up] + targetVdy[idx]);
-      }
-      if (y + 1 < height) {
-        const down = idx + width;
-        udyDown[idx] = 0.5 * (targetUdy[idx] + targetUdy[down]);
-        vdyDown[idx] = 0.5 * (targetVdy[idx] + targetVdy[down]);
+    }
+    // Black pass
+    for (let y = 0; y < height; y++) {
+      for (let x = 1 - (y % 2); x < width; x += 2) {
+        updateCoordinate(u, v, x, y, width, height, targetUdx, targetUdy, targetVdx, targetVdy, anchorWeight, omega);
       }
     }
   }
-  
-  // Conjugate Gradient solver for better convergence
-  // Solves: A*u = b where A is the discrete Laplacian with varying weights
-  const result = solveWithCG(u, v, width, height, anchorWeight, udxLeft, udxRight, udyUp, udyDown, 
-                             vdxLeft, vdxRight, vdyUp, vdyDown, options.coordinateIterations, 1e-4);
 
-  return result;
-}
-
-function boxBlurWeighted(input, weight, width, height, radius) {
-  const output = new Float32Array(width * height);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      let sum = 0;
-      let weightSum = 0;
-      for (let ky = -radius; ky <= radius; ky++) {
-        const sy = y + ky < 0 ? 0 : y + ky >= height ? height - 1 : y + ky;
-        for (let kx = -radius; kx <= radius; kx++) {
-          const sx = x + kx < 0 ? 0 : x + kx >= width ? width - 1 : x + kx;
-          const idx = sy * width + sx;
-          const w = weight[idx] + 1e-6;
-          sum += input[idx] * w;
-          weightSum += w;
-        }
-      }
-      output[y * width + x] = sum / weightSum;
-    }
-  }
-  return output;
-}
-
-function solveWithCG(u, v, width, height, anchorWeight, udxLeft, udxRight, udyUp, udyDown,
-                     vdxLeft, vdxRight, vdyUp, vdyDown, maxIters, tol) {
-  const count = width * height;
-  
-  // Build right-hand side (b) for both u and v
-  const bu = new Float32Array(count);
-  const bv = new Float32Array(count);
-  const diag = new Float32Array(count); // Diagonal preconditioner
-  
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = y * width + x;
-      const anchor = anchorWeight[idx];
-      
-      // RHS: anchor * position + boundary terms from derivatives
-      bu[idx] = anchor * x;
-      bv[idx] = anchor * y;
-      
-      let degree = 0;
-      if (x > 0) {
-        bu[idx] += udxLeft[idx];
-        bv[idx] += vdxLeft[idx];
-        degree++;
-      }
-      if (x + 1 < width) {
-        bu[idx] -= udxRight[idx];
-        bv[idx] -= vdxRight[idx];
-        degree++;
-      }
-      if (y > 0) {
-        bu[idx] += udyUp[idx];
-        bv[idx] += vdyUp[idx];
-        degree++;
-      }
-      if (y + 1 < height) {
-        bu[idx] -= udyDown[idx];
-        bv[idx] -= vdyDown[idx];
-        degree++;
-      }
-      
-      // Diagonal of A is (anchor + degree)
-      diag[idx] = anchor + degree;
-    }
-  }
-  
-  // Conjugate Gradient for u
-  u = conjugateGradient(u, bu, diag, width, height, anchorWeight, maxIters, tol);
-  
-  // Conjugate Gradient for v
-  v = conjugateGradient(v, bv, diag, width, height, anchorWeight, maxIters, tol);
-  
   return { u, v };
 }
 
-function conjugateGradient(x, b, diag, width, height, anchorWeight, maxIters, tol) {
-  const count = width * height;
-  const r = new Float32Array(count); // Residual
-  const z = new Float32Array(count); // Preconditioned residual
-  const p = new Float32Array(count); // Search direction
-  const Ap = new Float32Array(count); // A * p
+function updateCoordinate(u, v, x, y, width, height, targetUdx, targetUdy, targetVdx, targetVdy, anchorWeight, omega) {
+  const idx = y * width + x;
+  const anchor = anchorWeight[idx];
   
-  // Initial residual: r = b - A*x
-  applyA(x, Ap, width, height, anchorWeight);
-  for (let i = 0; i < count; i++) {
-    r[i] = b[i] - Ap[i];
-    z[i] = r[i] / (diag[i] + 1e-10); // Jacobi preconditioning
-    p[i] = z[i];
+  // Gather neighbors with centered differences
+  let uSum = 0, vSum = 0;
+  let weightSum = 0;
+  
+  if (x > 0) {
+    const left = idx - 1;
+    const w = 1.0;
+    // Left neighbor contributes based on target derivative between cells
+    uSum += w * (u[left] + 0.5 * (targetUdx[left] + targetUdx[idx]));
+    vSum += w * (v[left] + 0.5 * (targetVdx[left] + targetVdx[idx]));
+    weightSum += w;
+  }
+  if (x + 1 < width) {
+    const right = idx + 1;
+    const w = 1.0;
+    uSum += w * (u[right] - 0.5 * (targetUdx[idx] + targetUdx[right]));
+    vSum += w * (v[right] - 0.5 * (targetVdx[idx] + targetVdx[right]));
+    weightSum += w;
+  }
+  if (y > 0) {
+    const up = idx - width;
+    const w = 1.0;
+    uSum += w * (u[up] + 0.5 * (targetUdy[up] + targetUdy[idx]));
+    vSum += w * (v[up] + 0.5 * (targetVdy[up] + targetVdy[idx]));
+    weightSum += w;
+  }
+  if (y + 1 < height) {
+    const down = idx + width;
+    const w = 1.0;
+    uSum += w * (u[down] - 0.5 * (targetUdy[idx] + targetUdy[down]));
+    vSum += w * (v[down] - 0.5 * (targetVdy[idx] + targetVdy[down]));
+    weightSum += w;
   }
   
-  let rzOld = dotProduct(r, z);
-  const bNorm = Math.sqrt(dotProduct(b, b));
-  const threshold = tol * bNorm;
+  // Anchor term pulls toward original grid position
+  const targetU = x;
+  const targetV = y;
   
-  for (let iter = 0; iter < maxIters; iter++) {
-    // Ap = A * p
-    applyA(p, Ap, width, height, anchorWeight);
-    
-    const pAp = dotProduct(p, Ap);
-    if (Math.abs(pAp) < 1e-10) break;
-    
-    const alpha = rzOld / pAp;
-    
-    // x = x + alpha * p
-    // r = r - alpha * Ap
-    for (let i = 0; i < count; i++) {
-      x[i] += alpha * p[i];
-      r[i] -= alpha * Ap[i];
-    }
-    
-    // Check convergence
-    const rNorm = Math.sqrt(dotProduct(r, r));
-    if (rNorm < threshold) break;
-    
-    // z = M^-1 * r (Jacobi preconditioning)
-    for (let i = 0; i < count; i++) {
-      z[i] = r[i] / (diag[i] + 1e-10);
-    }
-    
-    const rzNew = dotProduct(r, z);
-    const beta = rzNew / (rzOld + 1e-10);
-    rzOld = rzNew;
-    
-    // p = z + beta * p
-    for (let i = 0; i < count; i++) {
-      p[i] = z[i] + beta * p[i];
-    }
-  }
+  // Solve: (anchor + weightSum) * u_new = anchor * target + uSum
+  const newU = (anchor * targetU + uSum) / (anchor + weightSum + 1e-10);
+  const newV = (anchor * targetV + vSum) / (anchor + weightSum + 1e-10);
   
-  return x;
+  // SOR update
+  u[idx] = (1 - omega) * u[idx] + omega * newU;
+  v[idx] = (1 - omega) * v[idx] + omega * newV;
 }
 
-function applyA(vec, result, width, height, anchorWeight) {
+function boxBlurWeighted(input, weight, width, height, radius) {
+  if (radius <= 0) return new Float32Array(input);
+  
+  const temp = new Float32Array(width * height);
+  const output = new Float32Array(width * height);
+  const diameter = radius * 2 + 1;
+  
+  // Horizontal pass using sliding window
   for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const idx = y * width + x;
-      const anchor = anchorWeight[idx];
-      let sum = anchor * vec[idx];
-      let degree = 0;
+    const rowStart = y * width;
+    let sum = 0;
+    let weightSum = 0;
+    
+    // Initialize window
+    for (let kx = -radius; kx <= radius; kx++) {
+      const sx = kx < 0 ? 0 : kx >= width ? width - 1 : kx;
+      const idx = rowStart + sx;
+      const w = weight[idx] + 1e-6;
+      sum += input[idx] * w;
+      weightSum += w;
+    }
+    temp[rowStart] = sum / weightSum;
+    
+    // Slide window
+    for (let x = 1; x < width; x++) {
+      const leftOut = x - radius - 1;
+      const leftIdx = rowStart + (leftOut < 0 ? 0 : leftOut);
+      const rightIn = x + radius;
+      const rightIdx = rowStart + (rightIn >= width ? width - 1 : rightIn);
       
-      if (x > 0) {
-        sum -= vec[idx - 1];
-        degree++;
-      }
-      if (x + 1 < width) {
-        sum -= vec[idx + 1];
-        degree++;
-      }
-      if (y > 0) {
-        sum -= vec[idx - width];
-        degree++;
-      }
-      if (y + 1 < height) {
-        sum -= vec[idx + width];
-        degree++;
-      }
+      const wLeft = weight[leftIdx] + 1e-6;
+      const wRight = weight[rightIdx] + 1e-6;
       
-      result[idx] = sum + degree * vec[idx];
+      sum = sum - input[leftIdx] * wLeft + input[rightIdx] * wRight;
+      weightSum = weightSum - wLeft + wRight;
+      
+      temp[rowStart + x] = sum / weightSum;
     }
   }
-}
-
-function dotProduct(a, b) {
-  let sum = 0;
-  for (let i = 0; i < a.length; i++) {
-    sum += a[i] * b[i];
+  
+  // Vertical pass using sliding window
+  for (let x = 0; x < width; x++) {
+    let sum = 0;
+    let weightSum = 0;
+    
+    // Initialize window
+    for (let ky = -radius; ky <= radius; ky++) {
+      const sy = ky < 0 ? 0 : ky >= height ? height - 1 : ky;
+      const idx = sy * width + x;
+      const w = weight[idx] + 1e-6;
+      sum += temp[idx] * w;
+      weightSum += w;
+    }
+    output[x] = sum / weightSum;
+    
+    // Slide window
+    for (let y = 1; y < height; y++) {
+      const topOut = y - radius - 1;
+      const topIdx = (topOut < 0 ? 0 : topOut) * width + x;
+      const bottomIn = y + radius;
+      const bottomIdx = (bottomIn >= height ? height - 1 : bottomIn) * width + x;
+      
+      const wTop = weight[topIdx] + 1e-6;
+      const wBottom = weight[bottomIdx] + 1e-6;
+      
+      sum = sum - temp[topIdx] * wTop + temp[bottomIdx] * wBottom;
+      weightSum = weightSum - wTop + wBottom;
+      
+      output[y * width + x] = sum / weightSum;
+    }
   }
-  return sum;
+  
+  return output;
 }
 
 module.exports = {
